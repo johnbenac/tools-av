@@ -23,7 +23,6 @@ exit codes:
   0   Success
   1   Error (bad arguments, missing files, ffmpeg failure)
   2   Duration mismatch (merge only)
-  3   Codec/container incompatibility
 
 Run 'av-cleaver <command> --help' for command-specific options.
 
@@ -49,6 +48,7 @@ options:
   -f, --format FORMAT    Output audio format: mp3, aac, flac, wav, ogg, opus
                          Triggers re-encode if different from source codec
   -b, --bitrate RATE     Bitrate for re-encoding (e.g. 128k, 192k, 320k)
+  -c, --copy             Copy audio codec without re-encoding (default)
   -r, --re-encode        Force re-encoding even when format matches source
   -v, --verbose          Show codec decisions, ffmpeg commands, and metadata info
   --dry-run              Print what would happen, but don't do it

@@ -21,10 +21,6 @@ class DurationMismatchError(AVCleaverError):
     """Duration validation failed"""
     pass
 
-class CodecIncompatibilityError(AVCleaverError):
-    """Codec/container incompatibility"""
-    pass
-
 
 def run_command(cmd, verbose=False, dry_run=False):
     """Run a command and return output"""
@@ -61,9 +57,11 @@ def probe_stream_duration(file_path, stream_type='a', verbose=False):
         output = run_command(cmd, verbose=False)
         if output and output != 'N/A':
             duration = float(output)
-            if verbose:
-                print(f"[INFO] Using {stream_type} stream duration: {duration:.3f}s")
-            return duration
+            # Treat 0.0 as invalid/missing
+            if duration > 0.0:
+                if verbose:
+                    print(f"[INFO] Using {stream_type} stream duration: {duration:.3f}s")
+                return duration
     except (ValueError, AVCleaverError):
         pass
 
@@ -119,7 +117,7 @@ def probe_audio_codec(file_path, verbose=False):
     return output
 
 
-def get_codec_extension(codec):
+def get_codec_extension(codec, verbose=False):
     """Map codec to preferred file extension"""
     codec_map = {
         'aac': 'm4a',
@@ -129,8 +127,20 @@ def get_codec_extension(codec):
         'vorbis': 'ogg',
         'ac3': 'ac3',
         'eac3': 'ac3',
+        'dts': 'dts',
+        'truehd': 'thd',
+        'pcm_s16le': 'wav',
+        'pcm_s24le': 'wav',
+        'pcm_s32le': 'wav',
     }
-    return codec_map.get(codec, 'm4a')  # Default to m4a
+
+    if codec in codec_map:
+        return codec_map[codec]
+
+    # Unknown codec - use MKA (Matroska Audio) as it accepts nearly everything
+    if verbose:
+        print(f"[INFO] Unknown codec '{codec}' - using .mka container (universal)")
+    return 'mka'
 
 
 def get_format_codec(format_name):
@@ -144,6 +154,43 @@ def get_format_codec(format_name):
         'opus': 'libopus',
     }
     return format_map.get(format_name.lower())
+
+
+def format_matches_codec(format_name, codec_name):
+    """Check if a format matches the source codec (for copy vs re-encode)"""
+    format_lower = format_name.lower()
+    codec_lower = codec_name.lower()
+
+    # Direct matches (format name == codec name)
+    if format_lower == codec_lower:
+        return True
+
+    # Special mappings for format/codec mismatches
+    format_codec_map = {
+        'ogg': ['vorbis'],
+        'opus': ['opus'],
+        'mp3': ['mp3'],
+        'aac': ['aac'],
+        'flac': ['flac'],
+        'wav': ['pcm_s16le', 'pcm_s24le', 'pcm_s32le'],
+    }
+
+    if format_lower in format_codec_map:
+        return codec_lower in format_codec_map[format_lower]
+
+    # Fallback to substring matching for other cases
+    return format_lower in codec_lower or codec_lower in format_lower
+
+
+def map_video_codec_name(codec_name):
+    """Map user-friendly video codec names to ffmpeg encoder names"""
+    codec_map = {
+        'h264': 'libx264',
+        'h265': 'libx265',
+        'vp9': 'libvpx-vp9',
+        'copy': 'copy',
+    }
+    return codec_map.get(codec_name, codec_name)
 
 
 def choose_audio_codec_for_merge(audio_file, output_container, verbose=False):
@@ -219,7 +266,7 @@ def split_audio(args):
         if args.format:
             ext = args.format
         else:
-            ext = get_codec_extension(source_codec)
+            ext = get_codec_extension(source_codec, args.verbose)
         output_path = video_path.parent / f"{video_path.stem}_audio.{ext}"
 
     # Check for overwrite
@@ -236,11 +283,8 @@ def split_audio(args):
         if not target_codec:
             raise AVCleaverError(f"Unknown format: {args.format}")
 
-        # Check if format matches source
-        format_matches = (args.format.lower() in source_codec.lower() or
-                         source_codec.lower() in args.format.lower())
-
-        if not format_matches or args.re_encode:
+        # Check if format matches source codec
+        if not format_matches_codec(args.format, source_codec) or args.re_encode:
             need_reencode = True
             audio_codec = target_codec
             if args.verbose:
@@ -258,6 +302,20 @@ def split_audio(args):
     elif need_reencode and audio_codec not in ['copy', 'flac', 'pcm_s16le']:
         bitrate_args = ['-b:a', '192k']  # Default bitrate
 
+    # For atomic writes, use temp file in same directory
+    if not args.dry_run:
+        # Create temp file in same directory as output (for atomic rename)
+        temp_fd, temp_path = tempfile.mkstemp(
+            suffix=output_path.suffix,
+            dir=output_path.parent,
+            prefix='.av-cleaver-tmp-'
+        )
+        os.close(temp_fd)  # Close fd, ffmpeg will open it
+        temp_path = Path(temp_path)
+        target_path = temp_path
+    else:
+        target_path = output_path
+
     # Build ffmpeg command
     cmd = [
         'ffmpeg',
@@ -270,13 +328,21 @@ def split_audio(args):
     if bitrate_args:
         cmd.extend(bitrate_args)
 
-    cmd.extend(['-y' if args.force else '-n', str(output_path)])
+    cmd.extend(['-y', str(target_path)])
 
     # Execute
-    run_command(cmd, verbose=args.verbose, dry_run=args.dry_run)
+    try:
+        run_command(cmd, verbose=args.verbose, dry_run=args.dry_run)
 
-    if not args.dry_run:
-        print(f"✓ Audio extracted to: {output_path}")
+        if not args.dry_run:
+            # Atomic rename on success
+            temp_path.rename(output_path)
+            print(f"✓ Audio extracted to: {output_path}")
+    except:
+        # Clean up temp file on failure
+        if not args.dry_run and temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 def merge_audio_video(args):
@@ -316,14 +382,32 @@ def merge_audio_video(args):
     audio_codec = choose_audio_codec_for_merge(args.audio_file, output_ext, args.verbose)
 
     # Determine video codec
-    video_codec = args.video_codec if args.video_codec else 'copy'
-    if args.verbose and video_codec == 'copy':
-        print(f"[INFO] Copying video (no re-encode)")
+    video_codec_input = args.video_codec if args.video_codec else 'copy'
+    video_codec = map_video_codec_name(video_codec_input)
+    if args.verbose:
+        if video_codec == 'copy':
+            print(f"[INFO] Copying video (no re-encode)")
+        else:
+            print(f"[INFO] Re-encoding video with {video_codec}")
 
     # Build bitrate args if transcoding audio
     bitrate_args = []
     if audio_codec != 'copy' and audio_codec not in ['flac', 'pcm_s16le']:
         bitrate_args = ['-b:a', '192k']
+
+    # For atomic writes, use temp file in same directory
+    if not args.dry_run:
+        # Create temp file in same directory as output (for atomic rename)
+        temp_fd, temp_path = tempfile.mkstemp(
+            suffix=output_path.suffix,
+            dir=output_path.parent,
+            prefix='.av-cleaver-tmp-'
+        )
+        os.close(temp_fd)  # Close fd, ffmpeg will open it
+        temp_path = Path(temp_path)
+        target_path = temp_path
+    else:
+        target_path = output_path
 
     # Build ffmpeg command
     cmd = [
@@ -340,15 +424,23 @@ def merge_audio_video(args):
     cmd.extend([
         '-map', '0:v:0',  # First video stream from first input
         '-map', '1:a:0',  # First audio stream from second input
-        '-y' if args.force else '-n',
-        str(output_path)
+        '-y',
+        str(target_path)
     ])
 
     # Execute
-    run_command(cmd, verbose=args.verbose, dry_run=args.dry_run)
+    try:
+        run_command(cmd, verbose=args.verbose, dry_run=args.dry_run)
 
-    if not args.dry_run:
-        print(f"✓ Merged output: {output_path}")
+        if not args.dry_run:
+            # Atomic rename on success
+            temp_path.rename(output_path)
+            print(f"✓ Merged output: {output_path}")
+    except:
+        # Clean up temp file on failure
+        if not args.dry_run and temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 def main():
@@ -461,9 +553,6 @@ def main():
     except DurationMismatchError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
-    except CodecIncompatibilityError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 3
     except AVCleaverError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1

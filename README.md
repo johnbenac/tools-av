@@ -117,6 +117,7 @@ av-cleaver split <video_file> [options]
   -o, --output FILE      Output filename
   -f, --format FORMAT    Audio format: mp3, aac, flac, wav, ogg, opus
   -b, --bitrate RATE     Bitrate for re-encoding (e.g., 192k, 320k)
+  -c, --copy             Copy audio codec without re-encoding (default)
   -r, --re-encode        Force re-encoding even when format matches
   -v, --verbose          Show decisions and ffmpeg commands
   --dry-run              Preview without executing
@@ -142,7 +143,6 @@ av-cleaver merge <video_file> <audio_file> [options]
 - **0**: Success
 - **1**: General error (missing file, bad arguments, ffmpeg failure)
 - **2**: Duration mismatch (merge only)
-- **3**: Codec/container incompatibility
 
 Useful for scripts:
 ```bash
@@ -188,9 +188,9 @@ av-cleaver merge video.mp4 audio.flac -t 0.5
 av-cleaver merge video.mp4 audio.mp3 -o final_cut.mp4
 ```
 
-**Replace and overwrite:**
+**Force overwrite existing output:**
 ```bash
-av-cleaver merge video.mp4 new_audio.mp3 -o video.mp4 --force
+av-cleaver merge video.mp4 audio.mp3 -o output.mp4 --force
 ```
 
 **Verbose mode (see what's happening):**
