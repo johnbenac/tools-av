@@ -1,0 +1,135 @@
+========================================
+$ av-cleaver --help
+========================================
+
+usage: av-cleaver <command> [options]
+
+Split audio from video, or merge them back together.
+Copies streams when possible. Re-encodes only when necessary.
+
+commands:
+  split     Extract audio from a video file
+  merge     Combine a video file and an audio file
+
+global options:
+  --version             Show version and exit
+  -h, --help            Show this help message
+
+examples:
+  av-cleaver split video.mp4
+  av-cleaver merge video.mp4 narration.mp3
+
+exit codes:
+  0   Success
+  1   Error (bad arguments, missing files, ffmpeg failure)
+  2   Duration mismatch (merge only)
+  3   Codec/container incompatibility
+
+Run 'av-cleaver <command> --help' for command-specific options.
+
+
+========================================
+$ av-cleaver split --help
+========================================
+
+usage: av-cleaver split <video_file> [options]
+
+Extract audio from a video file.
+
+By default, the audio stream is copied without re-encoding and saved
+to a container that matches the source codec (e.g. AAC → .m4a,
+MP3 → .mp3, Opus → .opus). If you specify a different format with
+-f, the audio is automatically re-encoded.
+
+positional arguments:
+  video_file             Video file to extract audio from
+
+options:
+  -o, --output FILE      Output filename (default: {name}_audio.{ext})
+  -f, --format FORMAT    Output audio format: mp3, aac, flac, wav, ogg, opus
+                         Triggers re-encode if different from source codec
+  -b, --bitrate RATE     Bitrate for re-encoding (e.g. 128k, 192k, 320k)
+  -r, --re-encode        Force re-encoding even when format matches source
+  -v, --verbose          Show codec decisions, ffmpeg commands, and metadata info
+  --dry-run              Print what would happen, but don't do it
+  --force                Overwrite output file if it already exists
+  -h, --help             Show this help message
+
+codec-to-container defaults (when copying):
+  AAC ........ .m4a         Opus ....... .opus
+  MP3 ........ .mp3         Vorbis ..... .ogg
+  FLAC ....... .flac        AC3 ........ .ac3
+
+examples:
+  av-cleaver split video.mp4
+      Copy audio as-is. AAC source → video_audio.m4a
+
+  av-cleaver split video.mp4 -f mp3
+      Re-encode to MP3 → video_audio.mp3
+
+  av-cleaver split video.mp4 -f mp3 -b 320k
+      Re-encode to MP3 at 320kbps
+
+  av-cleaver split video.mp4 -o vocals.m4a
+      Copy audio to a specific filename
+
+  av-cleaver split video.mkv -f flac -o soundtrack.flac
+      Re-encode MKV audio to FLAC
+
+  av-cleaver split video.mp4 --dry-run -v
+      Preview the operation without running it
+
+
+========================================
+$ av-cleaver merge --help
+========================================
+
+usage: av-cleaver merge <video_file> <audio_file> [options]
+
+Combine a video file and an audio file into a single output file.
+
+Before merging, the tool checks that audio and video durations match
+within a tolerance (default: 0.1 seconds). If they don't match, the
+merge is refused. This is intentional -- a duration mismatch usually
+means something went wrong upstream, and merging mismatched streams
+produces bad output. Fix the source, don't paper over it.
+
+The existing audio in the video file (if any) is replaced.
+Video and audio streams are copied without re-encoding when possible.
+If the audio codec is incompatible with the output container, it is
+automatically transcoded (e.g. FLAC → AAC for MP4 output).
+
+positional arguments:
+  video_file              Video file (provides the video stream)
+  audio_file              Audio file (provides the audio stream)
+
+options:
+  -o, --output FILE       Output filename (default: {name}_merged.{ext})
+  -t, --tolerance SECS    Duration match tolerance in seconds (default: 0.1)
+  -c, --video-codec CODEC Video codec: copy, h264, h265, vp9 (default: copy)
+  -v, --verbose           Show duration method, codec decisions, ffmpeg commands
+  --dry-run               Print what would happen, but don't do it
+  --force                 Overwrite output file if it already exists
+  -h, --help              Show this help message
+
+container compatibility (auto-handled):
+  MP4/MOV .... AAC, MP3, AC3 pass through; others transcode to AAC
+  MKV ........ Nearly everything passes through
+  WebM ....... Opus, Vorbis pass through; others transcode to Opus
+  AVI ........ MP3, AC3 pass through
+
+examples:
+  av-cleaver merge video.mp4 audio.mp3
+      Merge with default 0.1s tolerance
+
+  av-cleaver merge video.mp4 audio.mp3 -o final.mp4
+      Merge to a specific output filename
+
+  av-cleaver merge video.mp4 audio.flac -t 0.5
+      Allow up to 0.5s duration difference
+
+  av-cleaver merge video.mp4 audio.mp3 -o out.mp4 --force
+      Overwrite out.mp4 if it exists
+
+  av-cleaver merge video.mp4 audio.mp3 --dry-run -v
+      Preview the operation and show all decisions
