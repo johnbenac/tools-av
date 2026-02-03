@@ -109,7 +109,6 @@ AC3     → .ac3
   - `0`: Success
   - `1`: General error (bad args, missing files, etc.)
   - `2`: Duration validation failed
-  - `3`: Codec/format incompatibility
 
 **Mutually Exclusive Flag Enforcement:**
 - `--copy` and `--re-encode` are mutually exclusive (error if both specified)

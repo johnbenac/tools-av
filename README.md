@@ -198,7 +198,8 @@ av-cleaver merge video.mp4 audio.mp3 -o output.mp4 --force
 av-cleaver split video.mp4 -v
 # Shows:
 # [INFO] Copying audio as-is (aac)
-# [CMD] ffmpeg -i video.mp4 -vn -acodec copy -map 0:a:0 -n video_audio.m4a
+# [CMD] ffmpeg -i video.mp4 -vn -acodec copy -map 0:a:0 -y /path/.av-cleaver-tmp-xyz123.m4a
+# ✓ Audio extracted to: video_audio.m4a
 ```
 
 ## Troubleshooting

@@ -4,7 +4,6 @@ av-cleaver - Split audio from video, or merge them back together
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -269,6 +268,13 @@ def split_audio(args):
             ext = get_codec_extension(source_codec, args.verbose)
         output_path = video_path.parent / f"{video_path.stem}_audio.{ext}"
 
+    # Safety check: never overwrite input files
+    if output_path.resolve() == video_path.resolve():
+        raise AVCleaverError(
+            f"Output path cannot be the same as input file: {output_path}\n"
+            f"This would destroy your source video."
+        )
+
     # Check for overwrite
     if output_path.exists() and not args.force:
         raise AVCleaverError(f"Output file exists: {output_path}\nUse --force to overwrite")
@@ -312,6 +318,8 @@ def split_audio(args):
         )
         os.close(temp_fd)  # Close fd, ffmpeg will open it
         temp_path = Path(temp_path)
+        # Set readable permissions (mkstemp defaults to 0600)
+        os.chmod(temp_path, 0o644)
         target_path = temp_path
     else:
         target_path = output_path
@@ -351,12 +359,26 @@ def merge_audio_video(args):
     validate_file_exists(args.audio_file)
 
     video_path = Path(args.video_file)
+    audio_path = Path(args.audio_file)
 
     # Determine output file
     if args.output:
         output_path = Path(args.output)
     else:
         output_path = video_path.parent / f"{video_path.stem}_merged{video_path.suffix}"
+
+    # Safety check: never overwrite input files
+    output_resolved = output_path.resolve()
+    if output_resolved == video_path.resolve():
+        raise AVCleaverError(
+            f"Output path cannot be the same as video input: {output_path}\n"
+            f"This would destroy your source video."
+        )
+    if output_resolved == audio_path.resolve():
+        raise AVCleaverError(
+            f"Output path cannot be the same as audio input: {output_path}\n"
+            f"This would destroy your source audio."
+        )
 
     # Check for overwrite
     if output_path.exists() and not args.force:
@@ -405,6 +427,8 @@ def merge_audio_video(args):
         )
         os.close(temp_fd)  # Close fd, ffmpeg will open it
         temp_path = Path(temp_path)
+        # Set readable permissions (mkstemp defaults to 0600)
+        os.chmod(temp_path, 0o644)
         target_path = temp_path
     else:
         target_path = output_path
