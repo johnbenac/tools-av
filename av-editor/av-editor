@@ -162,19 +162,26 @@ def load_config(config_path):
                 if 'z_index' not in event:
                     raise AVEditorError(f"video_sources.{name}.timeline[{i}] missing 'z_index'")
 
-    if 'output' not in config:
-        raise AVEditorError("Config missing 'output' section")
+    if 'production' not in config:
+        raise AVEditorError("Config missing 'production' section")
 
-    out = config['output']
-    if 'file' not in out:
-        raise AVEditorError("output missing 'file'")
+    prod = config['production']
+    if 'output_file' not in prod:
+        raise AVEditorError("production missing 'output_file'")
+    if 'start_offset' not in prod:
+        raise AVEditorError("production missing 'start_offset'")
+    if 'end_offset' not in prod:
+        raise AVEditorError("production missing 'end_offset'")
 
     return config
 
 
-def build_z_timeline(sources, output_duration):
+def build_z_timeline(sources, master_clap, production_start, production_duration):
     """
     Build a complete z-index timeline for all sources.
+
+    Timeline events are specified in master audio absolute time, but we convert
+    them to production-relative time (0 = production start).
 
     Returns a list of (timestamp, {source_name: z_index}) representing
     all z-index changes across all sources.
@@ -195,11 +202,18 @@ def build_z_timeline(sources, output_duration):
         # Add timeline events if present
         if 'timeline' in src:
             for event in src['timeline']:
-                events.append({
-                    'at': float(event['at']),
-                    'source': name,
-                    'z_index': event['z_index']
-                })
+                # Convert from master audio absolute time to production-relative time
+                # Timeline event 'at' is offset from clap
+                absolute_time = master_clap + float(event['at'])
+                production_relative_time = absolute_time - production_start
+
+                # Only include events within production range
+                if 0 <= production_relative_time <= production_duration:
+                    events.append({
+                        'at': production_relative_time,
+                        'source': name,
+                        'z_index': event['z_index']
+                    })
 
     # Sort by timestamp
     events.sort(key=lambda e: e['at'])
@@ -275,21 +289,33 @@ def render(args):
         if 'timeline' in src and src['timeline']:
             print(f"    Timeline events: {len(src['timeline'])}")
 
-    # Output parameters
-    output_config = config['output']
-    output_file = output_config['file']
-    output_duration = float(output_config.get('duration', master_duration))
-    output_width = int(output_config.get('width', 1920))
-    output_height = int(output_config.get('height', 1080))
+    # Production parameters
+    production = config['production']
+    output_file = production['output_file']
+    start_offset = float(production['start_offset'])
+    end_offset = float(production['end_offset'])
+    output_width = int(production.get('width', 1920))
+    output_height = int(production.get('height', 1080))
 
-    if output_duration <= 0:
-        raise AVEditorError(f"Invalid output duration: {output_duration}")
+    # Calculate absolute timestamps in master audio timeline
+    # Offsets are relative to the clap time
+    production_start = master_clap + start_offset
+    production_end = master_clap + end_offset
+    production_duration = production_end - production_start
+
+    if production_duration <= 0:
+        raise AVEditorError(
+            f"Invalid production range: start_offset={start_offset}, end_offset={end_offset} "
+            f"(duration would be {production_duration:.3f}s)")
 
     output_path = Path(output_file)
 
-    print(f"\nOutput: {output_file}")
+    print(f"\nProduction:")
+    print(f"  Start offset from clap: {start_offset:+.3f}s (at {production_start:.3f}s in master audio)")
+    print(f"  End offset from clap: {end_offset:+.3f}s (at {production_end:.3f}s in master audio)")
+    print(f"  Duration: {production_duration:.3f}s")
     print(f"  Resolution: {output_width}x{output_height}")
-    print(f"  Duration: {output_duration:.3f}s")
+    print(f"  Output file: {output_file}")
 
     # Check for overwrite
     if output_path.exists() and not args.force:
@@ -297,7 +323,7 @@ def render(args):
             f"Output file exists: {output_file}\nUse --force to overwrite")
 
     # Build z-index timeline
-    z_timeline = build_z_timeline(video_sources, output_duration)
+    z_timeline = build_z_timeline(video_sources, master_clap, production_start, production_duration)
 
     if verbose:
         print(f"\n[INFO] Z-index timeline:")
@@ -308,23 +334,25 @@ def render(args):
     # Build ffmpeg command
     cmd = ['ffmpeg']
 
-    # Add all video inputs with sync offsets
+    # Add all video inputs with sync offsets adjusted for production start
     input_map = {}  # name -> input index
     for idx, (name, info) in enumerate(source_info.items()):
-        offset = info['offset']
+        # offset = how far into master audio timeline this video starts
+        # We want to seek to production_start in master audio time
+        # So in video time, we need: production_start - offset
+        video_seek = production_start - info['offset']
 
-        if offset > 0:
-            # Video starts after audio begins - delay it
-            cmd.extend(['-itsoffset', f'{offset:.3f}'])
-        elif offset < 0:
-            # Video starts before audio - seek into it
-            cmd.extend(['-ss', f'{abs(offset):.3f}'])
+        if video_seek > 0:
+            # Seek into the video file
+            cmd.extend(['-ss', f'{video_seek:.3f}'])
 
         cmd.extend(['-i', str(info['file'])])
         input_map[name] = idx
 
-    # Add audio input
+    # Add audio input, seeking to production start
     audio_idx = len(input_map)
+    if production_start > 0:
+        cmd.extend(['-ss', f'{production_start:.3f}'])
     cmd.extend(['-i', str(master_file)])
 
     # Build filter complex for overlay composition
@@ -335,7 +363,7 @@ def render(args):
     segments = []
     for i in range(len(z_timeline)):
         start_time = z_timeline[i][0]
-        end_time = z_timeline[i+1][0] if i+1 < len(z_timeline) else output_duration
+        end_time = z_timeline[i+1][0] if i+1 < len(z_timeline) else production_duration
         duration = end_time - start_time
 
         if duration <= 0:
@@ -385,7 +413,7 @@ def render(args):
 
     # Now overlay sources in order, with enable expressions
     # Start with a black background
-    filter_parts.append(f"color=c=black:s={output_width}x{output_height}:d={output_duration}[bg]")
+    filter_parts.append(f"color=c=black:s={output_width}x{output_height}:d={production_duration}[bg]")
 
     # Overlay each source on top with its enable expression
     prev_label = 'bg'
@@ -405,7 +433,7 @@ def render(args):
         '-filter_complex', filter_complex,
         '-map', '[out]',
         '-map', f'{audio_idx}:a:0',
-        '-t', f'{output_duration:.3f}',
+        '-t', f'{production_duration:.3f}',
         '-c:v', 'libx264',
         '-preset', 'medium',
         '-crf', '18',
