@@ -1,3 +1,10 @@
+# [0.2.0](https://github.com/johnbenac/tools-av/compare/v0.1.0...v0.2.0) (2026-02-15)
+
+
+### Features
+
+* **av-editor:** add multi-camera timeline with per-source z-index ([316381d](https://github.com/johnbenac/tools-av/commit/316381d5fde7de72368ccbe60f3edf4dc82863a8))
+
 # [0.1.0](https://github.com/johnbenac/tools-av/compare/v0.0.2...v0.1.0) (2026-02-15)
 
 
