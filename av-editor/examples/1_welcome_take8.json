@@ -1,0 +1,17 @@
+{
+  "master_audio": {
+    "file": "/media/Parure/TOOO_video/RPi_Rescue/1_welcome_to_me/take_8_audio_mic_card0_dev0.mka",
+    "clap_time": 22.767
+  },
+  "video_sources": [
+    {
+      "file": "/media/Parure/TOOO_video/RPi_Rescue/1_welcome_to_me/eos_6d_MVI_0808.MOV",
+      "clap_time": 20.621
+    }
+  ],
+  "output": {
+    "file": "/media/Parure/TOOO_video/RPi_Rescue/1_welcome_to_me/take_8_eos6d_synced.mp4",
+    "start": 0.0,
+    "end": 106.0
+  }
+}

@@ -533,20 +533,20 @@ def main():
     # Handle help before parsing
     if '-h' in sys.argv or '--help' in sys.argv:
         if 'split' in sys.argv:
-            with open('/opt/tools-av/USAGE.txt', 'r') as f:
+            with open('/opt/tools-av/av-cleaver/USAGE.txt', 'r') as f:
                 content = f.read()
                 start = content.find('$ av-cleaver split --help')
                 end = content.find('========================================\n$ av-cleaver merge --help')
                 print(content[start:end].replace('========================================\n', '').strip())
             return 0
         elif 'merge' in sys.argv:
-            with open('/opt/tools-av/USAGE.txt', 'r') as f:
+            with open('/opt/tools-av/av-cleaver/USAGE.txt', 'r') as f:
                 content = f.read()
                 start = content.find('$ av-cleaver merge --help')
                 print(content[start:].replace('========================================\n', '').strip())
             return 0
         else:
-            with open('/opt/tools-av/USAGE.txt', 'r') as f:
+            with open('/opt/tools-av/av-cleaver/USAGE.txt', 'r') as f:
                 content = f.read()
                 end = content.find('\n========================================\n$ av-cleaver split --help')
                 print(content[:end].replace('========================================\n', '').strip())
@@ -557,7 +557,7 @@ def main():
 
     # Handle no command
     if not args.command:
-        with open('/opt/tools-av/USAGE.txt', 'r') as f:
+        with open('/opt/tools-av/av-cleaver/USAGE.txt', 'r') as f:
             content = f.read()
             end = content.find('\n========================================\n$ av-cleaver split --help')
             print(content[:end].replace('========================================\n', '').strip())

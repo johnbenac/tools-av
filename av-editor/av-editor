@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+av-editor - Multi-source timeline editor with clapboard sync
+
+Synchronizes video and audio from multiple sources using clapboard
+timestamps, then renders a combined output via ffmpeg.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+
+class AVEditorError(Exception):
+    """Base exception for av-editor errors"""
+    pass
+
+
+def run_command(cmd, verbose=False, dry_run=False):
+    """Run a command and return output"""
+    if verbose or dry_run:
+        print(f"[CMD] {' '.join(cmd)}")
+
+    if dry_run:
+        return None
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise AVEditorError(f"Command failed: {' '.join(cmd)}\n{e.stderr}")
+
+
+def probe_duration(file_path, stream_type=None, verbose=False):
+    """Get duration of a file, trying stream duration first then format"""
+    if stream_type:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', f'{stream_type}:0',
+            '-show_entries', 'stream=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(file_path)
+        ]
+        try:
+            output = run_command(cmd)
+            if output and output != 'N/A':
+                dur = float(output)
+                if dur > 0:
+                    if verbose:
+                        print(f"[INFO] {file_path}: {stream_type} stream duration = {dur:.3f}s")
+                    return dur
+        except (ValueError, AVEditorError):
+            pass
+
+    # Fallback to format duration
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        str(file_path)
+    ]
+    output = run_command(cmd)
+    if output and output != 'N/A':
+        dur = float(output)
+        if verbose:
+            print(f"[INFO] {file_path}: format duration = {dur:.3f}s")
+        return dur
+
+    raise AVEditorError(f"Could not determine duration for {file_path}")
+
+
+def validate_file(file_path):
+    """Check file exists and is readable"""
+    p = Path(file_path)
+    if not p.exists():
+        raise AVEditorError(f"File not found: {file_path}")
+    if not p.is_file():
+        raise AVEditorError(f"Not a file: {file_path}")
+    if not os.access(p, os.R_OK):
+        raise AVEditorError(f"File not readable: {file_path}")
+
+
+def load_config(config_path):
+    """Load and validate JSON config file"""
+    validate_file(config_path)
+
+    with open(config_path, 'r') as f:
+        try:
+            config = json.load(f)
+        except json.JSONDecodeError as e:
+            raise AVEditorError(f"Invalid JSON in {config_path}: {e}")
+
+    # Validate required fields
+    if 'master_audio' not in config:
+        raise AVEditorError("Config missing 'master_audio' section")
+
+    ma = config['master_audio']
+    if 'file' not in ma:
+        raise AVEditorError("master_audio missing 'file'")
+    if 'clap_time' not in ma:
+        raise AVEditorError("master_audio missing 'clap_time'")
+
+    if 'video_sources' not in config or not config['video_sources']:
+        raise AVEditorError("Config missing 'video_sources' (need at least one)")
+
+    for i, vs in enumerate(config['video_sources']):
+        if 'file' not in vs:
+            raise AVEditorError(f"video_sources[{i}] missing 'file'")
+        if 'clap_time' not in vs:
+            raise AVEditorError(f"video_sources[{i}] missing 'clap_time'")
+
+    if 'output' not in config:
+        raise AVEditorError("Config missing 'output' section")
+
+    out = config['output']
+    if 'file' not in out:
+        raise AVEditorError("output missing 'file'")
+
+    return config
+
+
+def render(args):
+    """Render synchronized output from config"""
+    config = load_config(args.config)
+    verbose = args.verbose
+
+    master = config['master_audio']
+    master_file = master['file']
+    master_clap = float(master['clap_time'])
+
+    validate_file(master_file)
+    master_duration = probe_duration(master_file, stream_type='a', verbose=verbose)
+
+    print(f"Master audio: {master_file}")
+    print(f"  Duration: {master_duration:.3f}s")
+    print(f"  Clap at: {master_clap:.3f}s")
+
+    # For now, we use the first video source (multi-source switching comes later)
+    video_src = config['video_sources'][0]
+    video_file = video_src['file']
+    video_clap = float(video_src['clap_time'])
+
+    validate_file(video_file)
+    video_duration = probe_duration(video_file, stream_type='v', verbose=verbose)
+
+    print(f"\nVideo source: {video_file}")
+    print(f"  Duration: {video_duration:.3f}s")
+    print(f"  Clap at: {video_clap:.3f}s")
+
+    # Calculate sync offset
+    # offset = how far into master audio timeline the video starts
+    # If master clap is at 22.767 and video clap is at 20.621:
+    #   offset = 22.767 - 20.621 = 2.146
+    #   This means video t=0 corresponds to master audio t=2.146
+    #   So the first 2.146s of master audio have no video coverage
+    offset = master_clap - video_clap
+
+    print(f"\nSync offset: {offset:+.3f}s")
+    if offset > 0:
+        print(f"[INFO] Video starts {offset:.3f}s after master audio begins - "
+              f"black frames will fill the gap")
+    elif offset < 0:
+        print(f"[INFO] Video starts {abs(offset):.3f}s before master audio begins - "
+              f"video will be trimmed at the start")
+    else:
+        print(f"[INFO] Video and audio start at the same time")
+
+    # Check video end coverage relative to audio
+    # Video covers master audio time range: [offset, offset + video_duration]
+    video_end_in_master_time = offset + video_duration
+    if video_end_in_master_time < master_duration:
+        print(f"[INFO] Video ends at master audio time {video_end_in_master_time:.3f}s "
+              f"({master_duration - video_end_in_master_time:.3f}s before audio ends)")
+    elif video_end_in_master_time > master_duration:
+        print(f"[INFO] Video extends {video_end_in_master_time - master_duration:.3f}s "
+              f"past the end of master audio")
+
+    # Output parameters
+    output_config = config['output']
+    output_file = output_config['file']
+    output_start = float(output_config.get('start', 0.0))
+    output_end = float(output_config.get('end', master_duration))
+    output_duration = output_end - output_start
+
+    if output_duration <= 0:
+        raise AVEditorError(
+            f"Invalid output range: start={output_start}, end={output_end}")
+
+    output_path = Path(output_file)
+
+    print(f"\nOutput: {output_file}")
+    print(f"  Range: {output_start:.3f}s - {output_end:.3f}s "
+          f"(duration: {output_duration:.3f}s)")
+
+    # Check for overwrite
+    if output_path.exists() and not args.force:
+        raise AVEditorError(
+            f"Output file exists: {output_file}\nUse --force to overwrite")
+
+    # Calculate seek positions
+    # audio_seek = where to start reading in the master audio file
+    audio_seek = output_start
+
+    # video_seek = where to start reading in the video file
+    # master_audio_time = offset + video_time  =>  video_time = master_audio_time - offset
+    video_seek = output_start - offset
+
+    # Handle case where output starts before video is available
+    video_delay = 0.0
+    if video_seek < 0:
+        # Video hasn't started yet at output_start
+        # We need to delay the video and pad with black
+        video_delay = abs(video_seek)
+        video_seek = 0.0
+        print(f"[INFO] Padding {video_delay:.3f}s of black frames at start "
+              f"(video not yet available)")
+
+    if verbose:
+        print(f"\n[INFO] Audio seek: {audio_seek:.3f}s")
+        print(f"[INFO] Video seek: {video_seek:.3f}s")
+        if video_delay > 0:
+            print(f"[INFO] Video delay (black padding): {video_delay:.3f}s")
+
+    # Build ffmpeg command
+    # Strategy: use -ss for input seeking (fast, keyframe-based) and
+    # -itsoffset for fine-grained sync adjustment
+    cmd = ['ffmpeg']
+
+    if video_delay > 0:
+        # Video needs to be delayed - use -itsoffset on the video input
+        # This pushes the video forward in the timeline, creating black frames
+        cmd.extend(['-itsoffset', f'{video_delay:.3f}'])
+
+    # Video input with seek
+    if video_seek > 0:
+        cmd.extend(['-ss', f'{video_seek:.3f}'])
+    cmd.extend(['-i', str(video_file)])
+
+    # Audio input with seek
+    if audio_seek > 0:
+        cmd.extend(['-ss', f'{audio_seek:.3f}'])
+    cmd.extend(['-i', str(master_file)])
+
+    # Output options
+    cmd.extend([
+        '-t', f'{output_duration:.3f}',
+        '-map', '0:v:0',       # Video from first input (video file)
+        '-map', '1:a:0',       # Audio from second input (master audio)
+        '-c:v', 'libx264',     # Re-encode video for consistent output
+        '-preset', 'medium',
+        '-crf', '18',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', '+faststart',
+    ])
+
+    # For atomic writes, use temp file
+    if not args.dry_run:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_fd, temp_path = tempfile.mkstemp(
+            suffix=output_path.suffix,
+            dir=output_path.parent,
+            prefix='.av-editor-tmp-'
+        )
+        os.close(temp_fd)
+        temp_path = Path(temp_path)
+        os.chmod(temp_path, 0o644)
+        target = temp_path
+    else:
+        target = output_path
+
+    cmd.extend(['-y', str(target)])
+
+    print()
+    try:
+        run_command(cmd, verbose=verbose, dry_run=args.dry_run)
+
+        if not args.dry_run:
+            temp_path.rename(output_path)
+            print(f"\n-> Rendered: {output_path}")
+    except Exception:
+        if not args.dry_run and temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='av-editor',
+        description='Multi-source timeline editor with clapboard sync'
+    )
+    parser.add_argument('--version', action='version',
+                        version=f'av-editor {VERSION}')
+
+    subparsers = parser.add_subparsers(dest='command')
+
+    render_parser = subparsers.add_parser(
+        'render',
+        help='Render synchronized output from a config file'
+    )
+    render_parser.add_argument('config', help='JSON config file')
+    render_parser.add_argument('-v', '--verbose', action='store_true',
+                               help='Show ffmpeg commands and sync details')
+    render_parser.add_argument('--dry-run', action='store_true',
+                               help='Show what would happen without executing')
+    render_parser.add_argument('--force', action='store_true',
+                               help='Overwrite output file if it exists')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    try:
+        if args.command == 'render':
+            render(args)
+        return 0
+    except AVEditorError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"UNEXPECTED ERROR: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
