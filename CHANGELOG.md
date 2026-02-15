@@ -1,3 +1,10 @@
+## [0.2.1](https://github.com/johnbenac/tools-av/compare/v0.2.0...v0.2.1) (2026-02-15)
+
+
+### Bug Fixes
+
+* **av-editor:** correctly compute z-index state at production start ([7e19947](https://github.com/johnbenac/tools-av/commit/7e19947037926996d13e7730a337008cb956dac6))
+
 # [0.2.0](https://github.com/johnbenac/tools-av/compare/v0.1.0...v0.2.0) (2026-02-15)
 
 
