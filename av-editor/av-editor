@@ -3,7 +3,7 @@
 av-editor - Multi-source timeline editor with clapboard sync
 
 Synchronizes video and audio from multiple sources using clapboard
-timestamps, then renders a combined output via ffmpeg.
+timestamps, with per-source timelines for z-index based compositing.
 """
 
 import argparse
@@ -14,7 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 class AVEditorError(Exception):
@@ -25,7 +25,12 @@ class AVEditorError(Exception):
 def run_command(cmd, verbose=False, dry_run=False):
     """Run a command and return output"""
     if verbose or dry_run:
-        print(f"[CMD] {' '.join(cmd)}")
+        # Format command for readability
+        cmd_str = ' '.join(cmd)
+        if len(cmd_str) > 120:
+            print(f"[CMD] {cmd_str[:120]}...")
+        else:
+            print(f"[CMD] {cmd_str}")
 
     if dry_run:
         return None
@@ -58,7 +63,7 @@ def probe_duration(file_path, stream_type=None, verbose=False):
                 dur = float(output)
                 if dur > 0:
                     if verbose:
-                        print(f"[INFO] {file_path}: {stream_type} stream duration = {dur:.3f}s")
+                        print(f"[INFO] {Path(file_path).name}: {stream_type} stream duration = {dur:.3f}s")
                     return dur
         except (ValueError, AVEditorError):
             pass
@@ -74,10 +79,31 @@ def probe_duration(file_path, stream_type=None, verbose=False):
     if output and output != 'N/A':
         dur = float(output)
         if verbose:
-            print(f"[INFO] {file_path}: format duration = {dur:.3f}s")
+            print(f"[INFO] {Path(file_path).name}: format duration = {dur:.3f}s")
         return dur
 
     raise AVEditorError(f"Could not determine duration for {file_path}")
+
+
+def probe_resolution(file_path, verbose=False):
+    """Get video resolution (width, height)"""
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'json',
+        str(file_path)
+    ]
+    output = run_command(cmd)
+    data = json.loads(output)
+    if 'streams' in data and data['streams']:
+        stream = data['streams'][0]
+        width = stream.get('width')
+        height = stream.get('height')
+        if width and height:
+            return (width, height)
+
+    raise AVEditorError(f"Could not determine resolution for {file_path}")
 
 
 def validate_file(file_path):
@@ -114,11 +140,27 @@ def load_config(config_path):
     if 'video_sources' not in config or not config['video_sources']:
         raise AVEditorError("Config missing 'video_sources' (need at least one)")
 
-    for i, vs in enumerate(config['video_sources']):
+    # Validate video_sources is a dict with named sources
+    if not isinstance(config['video_sources'], dict):
+        raise AVEditorError("video_sources must be an object with named sources")
+
+    for name, vs in config['video_sources'].items():
         if 'file' not in vs:
-            raise AVEditorError(f"video_sources[{i}] missing 'file'")
+            raise AVEditorError(f"video_sources.{name} missing 'file'")
         if 'clap_time' not in vs:
-            raise AVEditorError(f"video_sources[{i}] missing 'clap_time'")
+            raise AVEditorError(f"video_sources.{name} missing 'clap_time'")
+        if 'z_index' not in vs:
+            raise AVEditorError(f"video_sources.{name} missing 'z_index'")
+
+        # Validate timeline if present
+        if 'timeline' in vs:
+            if not isinstance(vs['timeline'], list):
+                raise AVEditorError(f"video_sources.{name}.timeline must be an array")
+            for i, event in enumerate(vs['timeline']):
+                if 'at' not in event:
+                    raise AVEditorError(f"video_sources.{name}.timeline[{i}] missing 'at'")
+                if 'z_index' not in event:
+                    raise AVEditorError(f"video_sources.{name}.timeline[{i}] missing 'z_index'")
 
     if 'output' not in config:
         raise AVEditorError("Config missing 'output' section")
@@ -128,6 +170,56 @@ def load_config(config_path):
         raise AVEditorError("output missing 'file'")
 
     return config
+
+
+def build_z_timeline(sources, output_duration):
+    """
+    Build a complete z-index timeline for all sources.
+
+    Returns a list of (timestamp, {source_name: z_index}) representing
+    all z-index changes across all sources.
+    """
+    # Collect all timeline events from all sources
+    events = []
+
+    for name, src in sources.items():
+        default_z = src['z_index']
+
+        # Add initial state at t=0
+        events.append({
+            'at': 0.0,
+            'source': name,
+            'z_index': default_z
+        })
+
+        # Add timeline events if present
+        if 'timeline' in src:
+            for event in src['timeline']:
+                events.append({
+                    'at': float(event['at']),
+                    'source': name,
+                    'z_index': event['z_index']
+                })
+
+    # Sort by timestamp
+    events.sort(key=lambda e: e['at'])
+
+    # Build state changes
+    current_state = {name: src['z_index'] for name, src in sources.items()}
+    timeline = [(0.0, dict(current_state))]
+
+    for event in events:
+        if event['at'] == 0.0:
+            # Already handled in initial state
+            continue
+
+        # Update state
+        current_state[event['source']] = event['z_index']
+
+        # Add state snapshot
+        timeline.append((event['at'], dict(current_state)))
+
+    return timeline
 
 
 def render(args):
@@ -146,118 +238,175 @@ def render(args):
     print(f"  Duration: {master_duration:.3f}s")
     print(f"  Clap at: {master_clap:.3f}s")
 
-    # For now, we use the first video source (multi-source switching comes later)
-    video_src = config['video_sources'][0]
-    video_file = video_src['file']
-    video_clap = float(video_src['clap_time'])
+    # Process video sources
+    video_sources = config['video_sources']
+    source_info = {}
 
-    validate_file(video_file)
-    video_duration = probe_duration(video_file, stream_type='v', verbose=verbose)
+    print(f"\nVideo sources:")
+    for name, src in video_sources.items():
+        file_path = src['file']
+        clap_time = float(src['clap_time'])
+        default_z = src['z_index']
 
-    print(f"\nVideo source: {video_file}")
-    print(f"  Duration: {video_duration:.3f}s")
-    print(f"  Clap at: {video_clap:.3f}s")
+        validate_file(file_path)
+        duration = probe_duration(file_path, stream_type='v', verbose=verbose)
+        width, height = probe_resolution(file_path, verbose=verbose)
 
-    # Calculate sync offset
-    # offset = how far into master audio timeline the video starts
-    # If master clap is at 22.767 and video clap is at 20.621:
-    #   offset = 22.767 - 20.621 = 2.146
-    #   This means video t=0 corresponds to master audio t=2.146
-    #   So the first 2.146s of master audio have no video coverage
-    offset = master_clap - video_clap
+        # Calculate sync offset
+        offset = master_clap - clap_time
 
-    print(f"\nSync offset: {offset:+.3f}s")
-    if offset > 0:
-        print(f"[INFO] Video starts {offset:.3f}s after master audio begins - "
-              f"black frames will fill the gap")
-    elif offset < 0:
-        print(f"[INFO] Video starts {abs(offset):.3f}s before master audio begins - "
-              f"video will be trimmed at the start")
-    else:
-        print(f"[INFO] Video and audio start at the same time")
+        source_info[name] = {
+            'file': file_path,
+            'clap_time': clap_time,
+            'duration': duration,
+            'width': width,
+            'height': height,
+            'offset': offset,
+            'default_z': default_z,
+            'timeline': src.get('timeline', [])
+        }
 
-    # Check video end coverage relative to audio
-    # Video covers master audio time range: [offset, offset + video_duration]
-    video_end_in_master_time = offset + video_duration
-    if video_end_in_master_time < master_duration:
-        print(f"[INFO] Video ends at master audio time {video_end_in_master_time:.3f}s "
-              f"({master_duration - video_end_in_master_time:.3f}s before audio ends)")
-    elif video_end_in_master_time > master_duration:
-        print(f"[INFO] Video extends {video_end_in_master_time - master_duration:.3f}s "
-              f"past the end of master audio")
+        print(f"  [{name}] {Path(file_path).name}")
+        print(f"    Resolution: {width}x{height}")
+        print(f"    Duration: {duration:.3f}s")
+        print(f"    Clap at: {clap_time:.3f}s")
+        print(f"    Sync offset: {offset:+.3f}s")
+        print(f"    Default z_index: {default_z}")
+        if 'timeline' in src and src['timeline']:
+            print(f"    Timeline events: {len(src['timeline'])}")
 
     # Output parameters
     output_config = config['output']
     output_file = output_config['file']
-    output_start = float(output_config.get('start', 0.0))
-    output_end = float(output_config.get('end', master_duration))
-    output_duration = output_end - output_start
+    output_duration = float(output_config.get('duration', master_duration))
+    output_width = int(output_config.get('width', 1920))
+    output_height = int(output_config.get('height', 1080))
 
     if output_duration <= 0:
-        raise AVEditorError(
-            f"Invalid output range: start={output_start}, end={output_end}")
+        raise AVEditorError(f"Invalid output duration: {output_duration}")
 
     output_path = Path(output_file)
 
     print(f"\nOutput: {output_file}")
-    print(f"  Range: {output_start:.3f}s - {output_end:.3f}s "
-          f"(duration: {output_duration:.3f}s)")
+    print(f"  Resolution: {output_width}x{output_height}")
+    print(f"  Duration: {output_duration:.3f}s")
 
     # Check for overwrite
     if output_path.exists() and not args.force:
         raise AVEditorError(
             f"Output file exists: {output_file}\nUse --force to overwrite")
 
-    # Calculate seek positions
-    # audio_seek = where to start reading in the master audio file
-    audio_seek = output_start
-
-    # video_seek = where to start reading in the video file
-    # master_audio_time = offset + video_time  =>  video_time = master_audio_time - offset
-    video_seek = output_start - offset
-
-    # Handle case where output starts before video is available
-    video_delay = 0.0
-    if video_seek < 0:
-        # Video hasn't started yet at output_start
-        # We need to delay the video and pad with black
-        video_delay = abs(video_seek)
-        video_seek = 0.0
-        print(f"[INFO] Padding {video_delay:.3f}s of black frames at start "
-              f"(video not yet available)")
+    # Build z-index timeline
+    z_timeline = build_z_timeline(video_sources, output_duration)
 
     if verbose:
-        print(f"\n[INFO] Audio seek: {audio_seek:.3f}s")
-        print(f"[INFO] Video seek: {video_seek:.3f}s")
-        if video_delay > 0:
-            print(f"[INFO] Video delay (black padding): {video_delay:.3f}s")
+        print(f"\n[INFO] Z-index timeline:")
+        for timestamp, state in z_timeline:
+            z_sorted = sorted(state.items(), key=lambda x: x[1], reverse=True)
+            print(f"  {timestamp:6.2f}s: {', '.join(f'{n}={z}' for n, z in z_sorted)}")
 
     # Build ffmpeg command
-    # Strategy: use -ss for input seeking (fast, keyframe-based) and
-    # -itsoffset for fine-grained sync adjustment
     cmd = ['ffmpeg']
 
-    if video_delay > 0:
-        # Video needs to be delayed - use -itsoffset on the video input
-        # This pushes the video forward in the timeline, creating black frames
-        cmd.extend(['-itsoffset', f'{video_delay:.3f}'])
+    # Add all video inputs with sync offsets
+    input_map = {}  # name -> input index
+    for idx, (name, info) in enumerate(source_info.items()):
+        offset = info['offset']
 
-    # Video input with seek
-    if video_seek > 0:
-        cmd.extend(['-ss', f'{video_seek:.3f}'])
-    cmd.extend(['-i', str(video_file)])
+        if offset > 0:
+            # Video starts after audio begins - delay it
+            cmd.extend(['-itsoffset', f'{offset:.3f}'])
+        elif offset < 0:
+            # Video starts before audio - seek into it
+            cmd.extend(['-ss', f'{abs(offset):.3f}'])
 
-    # Audio input with seek
-    if audio_seek > 0:
-        cmd.extend(['-ss', f'{audio_seek:.3f}'])
+        cmd.extend(['-i', str(info['file'])])
+        input_map[name] = idx
+
+    # Add audio input
+    audio_idx = len(input_map)
     cmd.extend(['-i', str(master_file)])
 
-    # Output options
+    # Build filter complex for overlay composition
+    # Strategy: Create segments for each z-order change, then concat
+    filter_parts = []
+
+    # For each timeline segment, determine which source is on top
+    segments = []
+    for i in range(len(z_timeline)):
+        start_time = z_timeline[i][0]
+        end_time = z_timeline[i+1][0] if i+1 < len(z_timeline) else output_duration
+        duration = end_time - start_time
+
+        if duration <= 0:
+            continue
+
+        # Find source with highest z-index in this segment
+        state = z_timeline[i][1]
+        top_source = max(state.items(), key=lambda x: x[1])[0]
+
+        segments.append({
+            'start': start_time,
+            'end': end_time,
+            'duration': duration,
+            'source': top_source
+        })
+
+    if verbose:
+        print(f"\n[INFO] Video segments:")
+        for seg in segments:
+            print(f"  {seg['start']:6.2f}s - {seg['end']:6.2f}s ({seg['duration']:5.2f}s): {seg['source']}")
+
+    # Build filter: trim each source to its segments, then concatenate
+    # For now, simple approach: overlay all sources with enable expressions
+    # This is inefficient but works correctly
+
+    # Scale all sources
+    for name, idx in input_map.items():
+        filter_parts.append(f"[{idx}:v]scale={output_width}:{output_height}[scaled_{name}]")
+
+    # Build enable expression for each source based on when it's on top
+    source_enables = {}
+    for name in input_map.keys():
+        # Find all time ranges where this source is on top
+        ranges = []
+        for seg in segments:
+            if seg['source'] == name:
+                ranges.append((seg['start'], seg['end']))
+
+        # Build enable expression: between(t, start, end) for each range
+        if ranges:
+            enable_exprs = [f"between(t,{start:.3f},{end:.3f})" for start, end in ranges]
+            enable_expr = '+'.join(enable_exprs) if len(enable_exprs) > 1 else enable_exprs[0]
+        else:
+            enable_expr = "0"  # Never enabled
+
+        source_enables[name] = enable_expr
+
+    # Now overlay sources in order, with enable expressions
+    # Start with a black background
+    filter_parts.append(f"color=c=black:s={output_width}x{output_height}:d={output_duration}[bg]")
+
+    # Overlay each source on top with its enable expression
+    prev_label = 'bg'
+    for i, name in enumerate(input_map.keys()):
+        is_last = (i == len(input_map) - 1)
+        out_label = 'out' if is_last else f'layer{i}'
+
+        enable_expr = source_enables[name]
+        filter_parts.append(
+            f"[{prev_label}][scaled_{name}]overlay=0:0:enable='{enable_expr}'[{out_label}]"
+        )
+        prev_label = out_label
+
+    filter_complex = ';'.join(filter_parts)
+
     cmd.extend([
+        '-filter_complex', filter_complex,
+        '-map', '[out]',
+        '-map', f'{audio_idx}:a:0',
         '-t', f'{output_duration:.3f}',
-        '-map', '0:v:0',       # Video from first input (video file)
-        '-map', '1:a:0',       # Audio from second input (master audio)
-        '-c:v', 'libx264',     # Re-encode video for consistent output
+        '-c:v', 'libx264',
         '-preset', 'medium',
         '-crf', '18',
         '-c:a', 'aac',
@@ -288,7 +437,7 @@ def render(args):
 
         if not args.dry_run:
             temp_path.rename(output_path)
-            print(f"\n-> Rendered: {output_path}")
+            print(f"\n✓ Rendered: {output_path}")
     except Exception:
         if not args.dry_run and temp_path.exists():
             temp_path.unlink()
@@ -335,6 +484,8 @@ def main():
         return 1
     except Exception as e:
         print(f"UNEXPECTED ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         return 1
 
 
