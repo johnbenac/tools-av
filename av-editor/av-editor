@@ -180,57 +180,64 @@ def build_z_timeline(sources, master_clap, production_start, production_duration
     """
     Build a complete z-index timeline for all sources.
 
-    Timeline events are specified in master audio absolute time, but we convert
-    them to production-relative time (0 = production start).
+    Timeline events are specified as offsets from clap time.
+    We compute what the z-index state should be at production start,
+    then track changes throughout the production duration.
 
     Returns a list of (timestamp, {source_name: z_index}) representing
-    all z-index changes across all sources.
+    all z-index changes across all sources in production-relative time.
     """
-    # Collect all timeline events from all sources
-    events = []
+    production_end = production_start + production_duration
 
+    # For each source, build complete timeline in absolute master audio time
+    absolute_timelines = {}
     for name, src in sources.items():
         default_z = src['z_index']
+        events = [(0.0, default_z)]  # Start at beginning of master audio
 
-        # Add initial state at t=0
-        events.append({
-            'at': 0.0,
-            'source': name,
-            'z_index': default_z
-        })
-
-        # Add timeline events if present
         if 'timeline' in src:
             for event in src['timeline']:
-                # Convert from master audio absolute time to production-relative time
-                # Timeline event 'at' is offset from clap
+                # Convert offset from clap to absolute master audio time
                 absolute_time = master_clap + float(event['at'])
-                production_relative_time = absolute_time - production_start
+                events.append((absolute_time, event['z_index']))
 
-                # Only include events within production range
-                if 0 <= production_relative_time <= production_duration:
-                    events.append({
-                        'at': production_relative_time,
-                        'source': name,
-                        'z_index': event['z_index']
-                    })
+        events.sort(key=lambda e: e[0])
+        absolute_timelines[name] = events
+
+    # Determine z-index state at production start for each source
+    initial_state = {}
+    for name, events in absolute_timelines.items():
+        # Find the last event before or at production_start
+        current_z = sources[name]['z_index']  # Default
+        for timestamp, z_index in events:
+            if timestamp <= production_start:
+                current_z = z_index
+            else:
+                break
+        initial_state[name] = current_z
+
+    # Now collect all events that happen during production
+    production_events = []
+    for name, events in absolute_timelines.items():
+        for timestamp, z_index in events:
+            if production_start < timestamp <= production_end:
+                # Convert to production-relative time
+                prod_relative = timestamp - production_start
+                production_events.append({
+                    'at': prod_relative,
+                    'source': name,
+                    'z_index': z_index
+                })
 
     # Sort by timestamp
-    events.sort(key=lambda e: e['at'])
+    production_events.sort(key=lambda e: e['at'])
 
-    # Build state changes
-    current_state = {name: src['z_index'] for name, src in sources.items()}
+    # Build state changes timeline
+    current_state = dict(initial_state)
     timeline = [(0.0, dict(current_state))]
 
-    for event in events:
-        if event['at'] == 0.0:
-            # Already handled in initial state
-            continue
-
-        # Update state
+    for event in production_events:
         current_state[event['source']] = event['z_index']
-
-        # Add state snapshot
         timeline.append((event['at'], dict(current_state)))
 
     return timeline
