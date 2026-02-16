@@ -245,11 +245,11 @@ def load_config(config_path):
     return config
 
 
-def build_z_timeline(sources, master_clap, production_start, production_duration):
+def build_z_timeline(sources, production_start, production_duration):
     """
     Build a complete z-index timeline for all sources.
 
-    Timeline events are specified as offsets from clap time.
+    Timeline events are specified in absolute master audio time.
     We compute what the z-index state should be at production start,
     then track changes throughout the production duration.
 
@@ -266,8 +266,8 @@ def build_z_timeline(sources, master_clap, production_start, production_duration
 
         if 'timeline' in src:
             for event in src['timeline']:
-                # Convert offset from clap to absolute master audio time
-                absolute_time = master_clap + float(event['at'])
+                # timeline.at is already in absolute master-audio time
+                absolute_time = float(event['at'])
                 events.append((absolute_time, event['z_index']))
 
         events.sort(key=lambda e: e[0])
@@ -590,7 +590,7 @@ def render(args):
         input_index += 1
 
         # Build z-index timeline for this segment
-        z_timeline = build_z_timeline(video_sources, master_clap, seg_start, seg_duration)
+        z_timeline = build_z_timeline(video_sources, seg_start, seg_duration)
         top_segments = _top_segments_from_z_timeline(z_timeline, seg_duration)
 
         if verbose:
