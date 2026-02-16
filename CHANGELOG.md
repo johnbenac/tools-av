@@ -1,3 +1,10 @@
+# [0.3.0](https://github.com/johnbenac/tools-av/compare/v0.2.2...v0.3.0) (2026-02-16)
+
+
+### Features
+
+* **av-editor:** add production.includes for selective segment concatenation ([20b1147](https://github.com/johnbenac/tools-av/commit/20b1147662f095c691ef229d6f4f31dcfbe66261))
+
 ## [0.2.2](https://github.com/johnbenac/tools-av/compare/v0.2.1...v0.2.2) (2026-02-16)
 
 
