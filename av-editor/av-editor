@@ -168,10 +168,10 @@ def load_config(config_path):
     prod = config['production']
     if 'output_file' not in prod:
         raise AVEditorError("production missing 'output_file'")
-    if 'start_offset' not in prod:
-        raise AVEditorError("production missing 'start_offset'")
-    if 'end_offset' not in prod:
-        raise AVEditorError("production missing 'end_offset'")
+    if 'start' not in prod:
+        raise AVEditorError("production missing 'start'")
+    if 'end' not in prod:
+        raise AVEditorError("production missing 'end'")
 
     return config
 
@@ -299,27 +299,27 @@ def render(args):
     # Production parameters
     production = config['production']
     output_file = production['output_file']
-    start_offset = float(production['start_offset'])
-    end_offset = float(production['end_offset'])
+    start = float(production['start'])
+    end = float(production['end'])
     output_width = int(production.get('width', 1920))
     output_height = int(production.get('height', 1080))
 
     # Calculate absolute timestamps in master audio timeline
-    # Offsets are relative to the clap time
-    production_start = master_clap + start_offset
-    production_end = master_clap + end_offset
+    # start/end are absolute master audio timestamps
+    production_start = start
+    production_end = end
     production_duration = production_end - production_start
 
     if production_duration <= 0:
         raise AVEditorError(
-            f"Invalid production range: start_offset={start_offset}, end_offset={end_offset} "
+            f"Invalid production range: start={start}, end={end} "
             f"(duration would be {production_duration:.3f}s)")
 
     output_path = Path(output_file)
 
     print(f"\nProduction:")
-    print(f"  Start offset from clap: {start_offset:+.3f}s (at {production_start:.3f}s in master audio)")
-    print(f"  End offset from clap: {end_offset:+.3f}s (at {production_end:.3f}s in master audio)")
+    print(f"  Start in master audio: {production_start:.3f}s")
+    print(f"  End in master audio: {production_end:.3f}s")
     print(f"  Duration: {production_duration:.3f}s")
     print(f"  Resolution: {output_width}x{output_height}")
     print(f"  Output file: {output_file}")

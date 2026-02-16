@@ -20,8 +20,8 @@
     }
   },
   "production": {
-    "start_offset": 0.0,
-    "end_offset": 106.0,
+    "start": 22.767,
+    "end": 128.767,
     "output_file": "/media/Parure/TOOO_video/RPi_Rescue/1_welcome_to_me/take_8_multicam_v2.mp4",
     "width": 1920,
     "height": 1080
