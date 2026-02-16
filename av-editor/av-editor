@@ -28,6 +28,12 @@ class AVEditorError(Exception):
     pass
 
 
+def ffmpeg_has_encoder(encoder_name):
+    """Check whether ffmpeg supports a specific encoder."""
+    output = run_command(['ffmpeg', '-hide_banner', '-encoders'])
+    return f" {encoder_name} " in output
+
+
 def run_command(cmd, verbose=False, dry_run=False):
     """Run a command and return output"""
     if verbose or dry_run:
@@ -136,6 +142,44 @@ def _to_float(x: Any, ctx: str) -> float:
         raise AVEditorError(f"{ctx} must be a number, got {x!r}") from e
 
 
+def _parse_position(value: Any, ctx: str) -> Tuple[float, float]:
+    if not (isinstance(value, list) and len(value) == 2):
+        raise AVEditorError(f"{ctx} must be [x_percent, y_percent]")
+    x_pct = _to_float(value[0], f"{ctx}[0]")
+    y_pct = _to_float(value[1], f"{ctx}[1]")
+    # Allow off-canvas placement (negative or >100) for partial framing workflows.
+    return (x_pct, y_pct)
+
+
+def _parse_scale(value: Any, ctx: str) -> float:
+    scale_pct = _to_float(value, ctx)
+    if scale_pct <= 0.0:
+        raise AVEditorError(f"{ctx} must be > 0")
+    return scale_pct
+
+
+def _parse_crop(value: Any, ctx: str) -> Tuple[float, float, float, float]:
+    """Parse crop percentages [left, right, top, bottom]."""
+    if not (isinstance(value, list) and len(value) == 4):
+        raise AVEditorError(f"{ctx} must be [left, right, top, bottom]")
+
+    left_pct = _to_float(value[0], f"{ctx}[0]")
+    right_pct = _to_float(value[1], f"{ctx}[1]")
+    top_pct = _to_float(value[2], f"{ctx}[2]")
+    bottom_pct = _to_float(value[3], f"{ctx}[3]")
+
+    for idx, v in enumerate((left_pct, right_pct, top_pct, bottom_pct)):
+        if not (0.0 <= v <= 100.0):
+            raise AVEditorError(f"{ctx}[{idx}] must be between 0 and 100")
+
+    if left_pct + right_pct >= 100.0:
+        raise AVEditorError(f"{ctx} left+right must be < 100")
+    if top_pct + bottom_pct >= 100.0:
+        raise AVEditorError(f"{ctx} top+bottom must be < 100")
+
+    return (left_pct, right_pct, top_pct, bottom_pct)
+
+
 def _safe_label(text: str) -> str:
     """Make a string safe for ffmpeg filter labels."""
     return re.sub(r'[^0-9A-Za-z_]', '_', text)
@@ -215,16 +259,50 @@ def load_config(config_path):
             raise AVEditorError(f"video_sources.{name} missing 'clap_time'")
         if 'z_index' not in vs:
             raise AVEditorError(f"video_sources.{name} missing 'z_index'")
+        _to_float(vs['z_index'], f"video_sources.{name}.z_index")
+
+        # Optional placement/crop controls:
+        # - position: [x_percent, y_percent] for top-left corner
+        # - scale: percent of output size (100 means full frame)
+        # - crop: [left, right, top, bottom] in percent of source frame
+        if 'position' in vs:
+            _parse_position(vs['position'], f"video_sources.{name}.position")
+
+        if 'scale' in vs:
+            _parse_scale(vs['scale'], f"video_sources.{name}.scale")
+
+        if 'crop' in vs:
+            _parse_crop(vs['crop'], f"video_sources.{name}.crop")
 
         # Validate timeline if present
         if 'timeline' in vs:
             if not isinstance(vs['timeline'], list):
                 raise AVEditorError(f"video_sources.{name}.timeline must be an array")
             for i, event in enumerate(vs['timeline']):
+                if not isinstance(event, dict):
+                    raise AVEditorError(f"video_sources.{name}.timeline[{i}] must be an object")
                 if 'at' not in event:
                     raise AVEditorError(f"video_sources.{name}.timeline[{i}] missing 'at'")
-                if 'z_index' not in event:
-                    raise AVEditorError(f"video_sources.{name}.timeline[{i}] missing 'z_index'")
+                _to_float(event['at'], f"video_sources.{name}.timeline[{i}].at")
+
+                has_change = False
+                if 'z_index' in event:
+                    _to_float(event['z_index'], f"video_sources.{name}.timeline[{i}].z_index")
+                    has_change = True
+                if 'position' in event:
+                    _parse_position(event['position'], f"video_sources.{name}.timeline[{i}].position")
+                    has_change = True
+                if 'scale' in event:
+                    _parse_scale(event['scale'], f"video_sources.{name}.timeline[{i}].scale")
+                    has_change = True
+                if 'crop' in event:
+                    _parse_crop(event['crop'], f"video_sources.{name}.timeline[{i}].crop")
+                    has_change = True
+
+                if not has_change:
+                    raise AVEditorError(
+                        f"video_sources.{name}.timeline[{i}] must include at least one of "
+                        f"'z_index', 'position', 'scale', or 'crop'")
 
     if 'production' not in config:
         raise AVEditorError("Config missing 'production' section")
@@ -245,69 +323,156 @@ def load_config(config_path):
     return config
 
 
-def build_z_timeline(sources, production_start, production_duration):
+def build_source_state_timeline(sources, production_start, production_duration):
     """
-    Build a complete z-index timeline for all sources.
+    Build a complete per-source state timeline for z-index and placement.
 
-    Timeline events are specified in absolute master audio time.
-    We compute what the z-index state should be at production start,
-    then track changes throughout the production duration.
+    Timeline events are absolute master-audio times and may update any subset
+    of: z_index, position, scale, crop.
 
-    Returns a list of (timestamp, {source_name: z_index}) representing
-    all z-index changes across all sources in production-relative time.
+    Returns a list of:
+      (timestamp_in_segment, {
+          source_name: {
+              'z_index': float,
+              'position_x_pct': float,
+              'position_y_pct': float,
+              'scale_pct': float,
+              'crop_left_pct': float,
+              'crop_right_pct': float,
+              'crop_top_pct': float,
+              'crop_bottom_pct': float
+          }
+      })
     """
     production_end = production_start + production_duration
 
-    # For each source, build complete timeline in absolute master audio time
-    absolute_timelines = {}
+    # For each source, build a timeline of partial state updates in absolute master time.
+    absolute_timelines: Dict[str, List[Dict[str, float]]] = {}
+    default_states: Dict[str, Dict[str, float]] = {}
     for name, src in sources.items():
-        default_z = src['z_index']
-        events = [(0.0, default_z)]  # Start at beginning of master audio
+        pos_x_pct, pos_y_pct = _parse_position(src.get('position', [0.0, 0.0]),
+                                               f"video_sources.{name}.position")
+        scale_pct = _parse_scale(src.get('scale', 100.0), f"video_sources.{name}.scale")
+        crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct = _parse_crop(
+            src.get('crop', [0.0, 0.0, 0.0, 0.0]),
+            f"video_sources.{name}.crop"
+        )
+        default_state = {
+            'z_index': _to_float(src['z_index'], f"video_sources.{name}.z_index"),
+            'position_x_pct': pos_x_pct,
+            'position_y_pct': pos_y_pct,
+            'scale_pct': scale_pct,
+            'crop_left_pct': crop_left_pct,
+            'crop_right_pct': crop_right_pct,
+            'crop_top_pct': crop_top_pct,
+            'crop_bottom_pct': crop_bottom_pct
+        }
+        default_states[name] = dict(default_state)
 
+        events: List[Dict[str, float]] = [{'at': 0.0, **default_state}]
         if 'timeline' in src:
-            for event in src['timeline']:
-                # timeline.at is already in absolute master-audio time
-                absolute_time = float(event['at'])
-                events.append((absolute_time, event['z_index']))
+            for i, event in enumerate(src['timeline']):
+                absolute_time = _to_float(event['at'], f"video_sources.{name}.timeline[{i}].at")
+                event_update: Dict[str, float] = {'at': absolute_time}
 
-        events.sort(key=lambda e: e[0])
+                if 'z_index' in event:
+                    event_update['z_index'] = _to_float(
+                        event['z_index'],
+                        f"video_sources.{name}.timeline[{i}].z_index"
+                    )
+                if 'position' in event:
+                    event_pos_x_pct, event_pos_y_pct = _parse_position(
+                        event['position'],
+                        f"video_sources.{name}.timeline[{i}].position"
+                    )
+                    event_update['position_x_pct'] = event_pos_x_pct
+                    event_update['position_y_pct'] = event_pos_y_pct
+                if 'scale' in event:
+                    event_update['scale_pct'] = _parse_scale(
+                        event['scale'],
+                        f"video_sources.{name}.timeline[{i}].scale"
+                    )
+                if 'crop' in event:
+                    event_crop_left_pct, event_crop_right_pct, event_crop_top_pct, event_crop_bottom_pct = _parse_crop(
+                        event['crop'],
+                        f"video_sources.{name}.timeline[{i}].crop"
+                    )
+                    event_update['crop_left_pct'] = event_crop_left_pct
+                    event_update['crop_right_pct'] = event_crop_right_pct
+                    event_update['crop_top_pct'] = event_crop_top_pct
+                    event_update['crop_bottom_pct'] = event_crop_bottom_pct
+
+                events.append(event_update)
+
+        events.sort(key=lambda e: e['at'])
         absolute_timelines[name] = events
 
-    # Determine z-index state at production start for each source
-    initial_state = {}
+    # Determine full source state at production start.
+    initial_state: Dict[str, Dict[str, float]] = {}
     for name, events in absolute_timelines.items():
-        # Find the last event before or at production_start
-        current_z = sources[name]['z_index']  # Default
-        for timestamp, z_index in events:
+        current_state = dict(default_states[name])
+        for event in events:
+            timestamp = event['at']
             if timestamp <= production_start:
-                current_z = z_index
+                for key in (
+                    'z_index',
+                    'position_x_pct',
+                    'position_y_pct',
+                    'scale_pct',
+                    'crop_left_pct',
+                    'crop_right_pct',
+                    'crop_top_pct',
+                    'crop_bottom_pct'
+                ):
+                    if key in event:
+                        current_state[key] = event[key]
             else:
                 break
-        initial_state[name] = current_z
+        initial_state[name] = dict(current_state)
 
-    # Now collect all events that happen during production
-    production_events = []
+    # Collect all state updates that happen during production.
+    production_events: List[Dict[str, Any]] = []
     for name, events in absolute_timelines.items():
-        for timestamp, z_index in events:
+        for event in events:
+            timestamp = event['at']
             if production_start < timestamp <= production_end:
-                # Convert to production-relative time
-                prod_relative = timestamp - production_start
-                production_events.append({
-                    'at': prod_relative,
-                    'source': name,
-                    'z_index': z_index
-                })
+                changes: Dict[str, float] = {}
+                for key in (
+                    'z_index',
+                    'position_x_pct',
+                    'position_y_pct',
+                    'scale_pct',
+                    'crop_left_pct',
+                    'crop_right_pct',
+                    'crop_top_pct',
+                    'crop_bottom_pct'
+                ):
+                    if key in event:
+                        changes[key] = event[key]
+                if changes:
+                    production_events.append({
+                        'at': timestamp - production_start,
+                        'source': name,
+                        'changes': changes
+                    })
 
-    # Sort by timestamp
     production_events.sort(key=lambda e: e['at'])
 
-    # Build state changes timeline
-    current_state = dict(initial_state)
-    timeline = [(0.0, dict(current_state))]
+    current_state: Dict[str, Dict[str, float]] = {
+        name: dict(state) for name, state in initial_state.items()
+    }
+    timeline: List[Tuple[float, Dict[str, Dict[str, float]]]] = [
+        (0.0, {name: dict(state) for name, state in current_state.items()})
+    ]
 
     for event in production_events:
-        current_state[event['source']] = event['z_index']
-        timeline.append((event['at'], dict(current_state)))
+        source = event['source']
+        for key, value in event['changes'].items():
+            current_state[source][key] = value
+        timeline.append((
+            event['at'],
+            {name: dict(state) for name, state in current_state.items()}
+        ))
 
     return timeline
 
@@ -409,33 +574,21 @@ def parse_includes(includes: Dict[str, Any],
     return merged
 
 
-def _top_segments_from_z_timeline(z_timeline: List[Tuple[float, Dict[str, int]]],
-                                 duration: float) -> List[Dict[str, Any]]:
-    """Convert z_timeline into concrete time segments with a single top source."""
+def _state_segments_from_timeline(state_timeline: List[Tuple[float, Dict[str, Dict[str, float]]]],
+                                  duration: float) -> List[Dict[str, Any]]:
+    """Convert a state timeline into contiguous segments with constant source state."""
     segs: List[Dict[str, Any]] = []
-    for i in range(len(z_timeline)):
-        start_time = float(z_timeline[i][0])
-        end_time = float(z_timeline[i + 1][0]) if i + 1 < len(z_timeline) else float(duration)
-        dur = end_time - start_time
-        if dur <= 0:
+    for i in range(len(state_timeline)):
+        start_time = float(state_timeline[i][0])
+        end_time = float(state_timeline[i + 1][0]) if i + 1 < len(state_timeline) else float(duration)
+        if end_time <= start_time:
             continue
-        state = z_timeline[i][1]
-        top_source = max(state.items(), key=lambda x: x[1])[0]
-        segs.append({'start': start_time, 'end': end_time, 'source': top_source})
+        segs.append({
+            'start': start_time,
+            'end': end_time,
+            'state': {name: dict(props) for name, props in state_timeline[i][1].items()}
+        })
     return segs
-
-
-def _enable_expr_for_source(segments: List[Dict[str, Any]], source_name: str) -> str:
-    """
-    Build an ffmpeg enable expression that is true exactly when source_name is top.
-
-    Uses half-open intervals: [start, end) to avoid double-enabling at boundaries.
-    """
-    ranges = [(s['start'], s['end']) for s in segments if s['source'] == source_name]
-    if not ranges:
-        return "0"
-    parts = [f"(gte(t,{start:.3f})*lt(t,{end:.3f}))" for start, end in ranges]
-    return "+".join(parts)
 
 
 def render(args):
@@ -462,7 +615,16 @@ def render(args):
     for name, src in video_sources.items():
         file_path = src['file']
         clap_time = float(src['clap_time'])
-        default_z = src['z_index']
+        default_z = _to_float(src['z_index'], f"video_sources.{name}.z_index")
+        pos_x_pct, pos_y_pct = _parse_position(
+            src.get('position', [0.0, 0.0]),
+            f"video_sources.{name}.position"
+        )
+        scale_pct = _parse_scale(src.get('scale', 100.0), f"video_sources.{name}.scale")
+        crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct = _parse_crop(
+            src.get('crop', [0.0, 0.0, 0.0, 0.0]),
+            f"video_sources.{name}.crop"
+        )
 
         validate_file(file_path)
         duration = probe_duration(file_path, stream_type='v', verbose=verbose)
@@ -480,7 +642,14 @@ def render(args):
             'height': height,
             'offset': offset,
             'default_z': default_z,
-            'timeline': src.get('timeline', [])
+            'timeline': src.get('timeline', []),
+            'position_x_pct': pos_x_pct,
+            'position_y_pct': pos_y_pct,
+            'scale_pct': scale_pct,
+            'crop_left_pct': crop_left_pct,
+            'crop_right_pct': crop_right_pct,
+            'crop_top_pct': crop_top_pct,
+            'crop_bottom_pct': crop_bottom_pct
         }
 
         print(f"  [{name}] {Path(file_path).name}")
@@ -488,7 +657,10 @@ def render(args):
         print(f"    Duration: {duration:.3f}s")
         print(f"    Clap at: {clap_time:.3f}s")
         print(f"    Sync offset: {offset:+.3f}s")
-        print(f"    Default z_index: {default_z}")
+        print(f"    Default z_index: {default_z:g}")
+        print(f"    Placement: x={pos_x_pct:.1f}%, y={pos_y_pct:.1f}%, scale={scale_pct:.1f}%")
+        print(f"    Crop: l={crop_left_pct:.1f}%, r={crop_right_pct:.1f}%, "
+              f"t={crop_top_pct:.1f}%, b={crop_bottom_pct:.1f}%")
         if 'timeline' in src and src['timeline']:
             print(f"    Timeline events: {len(src['timeline'])}")
 
@@ -545,6 +717,10 @@ def render(args):
     # Build ffmpeg command
     cmd: List[str] = ['ffmpeg']
 
+    # Enable NVIDIA hardware acceleration for decoding
+    # Using 'auto' format so filters work normally, then we encode with NVENC
+    cmd.extend(['-hwaccel', 'cuda'])
+
     filter_parts: List[str] = []
     seg_video_labels: List[str] = []
     seg_audio_labels: List[str] = []
@@ -561,11 +737,11 @@ def render(args):
 
         # Inputs for this segment
         seg_input_map: Dict[str, int] = {}
-        seg_stream_labels: Dict[str, str] = {}   # name -> filter label for video stream post-scale/pad
         seg_delays: Dict[str, float] = {}         # name -> start pad duration when we can't seek negative
+        seg_source_order: Dict[str, int] = {}     # name -> stable tie-breaker for equal z_index
 
         # Add all video inputs for this segment
-        for name, info in source_info.items():
+        for source_ord, (name, info) in enumerate(source_info.items()):
             seek = seg_start - info['offset']  # desired video timestamp at segment start
             delay = 0.0
             if seek > 0:
@@ -579,6 +755,7 @@ def render(args):
 
             seg_input_map[name] = input_index
             seg_delays[name] = delay
+            seg_source_order[name] = source_ord
             input_index += 1
 
         # Add audio input for this segment (master audio)
@@ -589,66 +766,107 @@ def render(args):
         seg_audio_idx = input_index
         input_index += 1
 
-        # Build z-index timeline for this segment
-        z_timeline = build_z_timeline(video_sources, seg_start, seg_duration)
-        top_segments = _top_segments_from_z_timeline(z_timeline, seg_duration)
+        # Build per-source state timeline for this segment.
+        state_timeline = build_source_state_timeline(video_sources, seg_start, seg_duration)
+        state_segments = _state_segments_from_timeline(state_timeline, seg_duration)
 
         if verbose:
-            print(f"[INFO] Z-index timeline (segment {seg_idx}):")
-            for ts, state in z_timeline:
-                z_sorted = sorted(state.items(), key=lambda x: x[1], reverse=True)
-                print(f"  {ts:6.2f}s: {', '.join(f'{n}={z}' for n, z in z_sorted)}")
-            print(f"[INFO] Top-source segments (segment {seg_idx}):")
-            for s in top_segments:
-                print(f"  {s['start']:6.2f}s - {s['end']:6.2f}s: {s['source']}")
-
-        # Scale all sources (+ setsar), and if needed pad start to compensate for negative seek
-        for name, idx in seg_input_map.items():
-            safe_name = _safe_label(name)
-            base = f"seg{seg_idx}_{safe_name}"
-            scaled = f"scaled_{base}"
-            filter_parts.append(
-                f"[{idx}:v]scale={output_width}:{output_height},setsar=1[{scaled}]"
-            )
-
-            delay = seg_delays.get(name, 0.0)
-            if delay > 0.0005:
-                padded = f"pad_{base}"
-                filter_parts.append(
-                    f"[{scaled}]tpad=start_duration={delay:.3f}:start_mode=add[{padded}]"
+            print(f"[INFO] Source state timeline (segment {seg_idx}):")
+            for ts, state in state_timeline:
+                draw_order = sorted(state.keys(), key=lambda n: (state[n]['z_index'], seg_source_order.get(n, 0)))
+                state_text = ', '.join(
+                    f"{name}:z={state[name]['z_index']:g},x={state[name]['position_x_pct']:.1f},"
+                    f"y={state[name]['position_y_pct']:.1f},s={state[name]['scale_pct']:.1f},"
+                    f"c={state[name]['crop_left_pct']:.1f}/{state[name]['crop_right_pct']:.1f}/"
+                    f"{state[name]['crop_top_pct']:.1f}/{state[name]['crop_bottom_pct']:.1f}"
+                    for name in draw_order
                 )
-                seg_stream_labels[name] = padded
-            else:
-                seg_stream_labels[name] = scaled
+                print(f"  {ts:6.2f}s: {state_text}")
 
-        # Background canvas for this segment
-        bg = f"bg{seg_idx}"
-        filter_parts.append(
-            f"color=c=black:s={output_width}x{output_height}:d={seg_duration:.3f}[{bg}]"
-        )
+        if verbose:
+            print(f"[INFO] Layered z-state segments (segment {seg_idx}):")
+            for s in state_segments:
+                st = float(s['start'])
+                en = float(s['end'])
+                state = s['state']
+                draw_order = sorted(state.keys(), key=lambda n: (state[n]['z_index'], seg_source_order.get(n, 0)))
+                z_text = ', '.join(f"{name}={state[name]['z_index']:g}" for name in draw_order)
+                print(f"  {st:6.2f}s - {en:6.2f}s: {z_text}")
 
-        # Enable expressions per source for this segment
-        source_enables: Dict[str, str] = {}
-        for name in seg_input_map.keys():
-            source_enables[name] = _enable_expr_for_source(top_segments, name)
+        # Build per-state layered video clips, then concat into this include-segment video.
+        state_video_labels: List[str] = []
+        for state_idx, state_seg in enumerate(state_segments):
+            state_start = float(state_seg['start'])
+            state_end = float(state_seg['end'])
+            state_duration = state_end - state_start
+            state = state_seg['state']
 
-        # Overlay chain
-        prev_label = bg
-        names_in_order = list(seg_input_map.keys())
-        for i, name in enumerate(names_in_order):
-            is_last = (i == len(names_in_order) - 1)
-            out_label = f"seg{seg_idx}_out" if is_last else f"seg{seg_idx}_layer{i}"
-
-            enable_expr = source_enables[name]
-            src_label = seg_stream_labels[name]
+            bg_label = f"seg{seg_idx}_st{state_idx}_bg"
             filter_parts.append(
-                f"[{prev_label}][{src_label}]overlay=0:0:enable='{enable_expr}'[{out_label}]"
+                f"color=c=black:s={output_width}x{output_height}:d={state_duration:.3f}[{bg_label}]"
             )
-            prev_label = out_label
 
-        # Normalize format and timestamps for concat
+            draw_order = sorted(state.keys(), key=lambda n: (state[n]['z_index'], seg_source_order.get(n, 0)))
+            if not draw_order:
+                state_out = f"seg{seg_idx}_st{state_idx}_v"
+                filter_parts.append(f"[{bg_label}]format=yuv420p,setpts=PTS-STARTPTS[{state_out}]")
+                state_video_labels.append(state_out)
+                continue
+
+            prev_label = bg_label
+            for layer_idx, name in enumerate(draw_order):
+                safe_name = _safe_label(name)
+                clip_label = f"seg{seg_idx}_st{state_idx}_{safe_name}_clip"
+                out_label = (
+                    f"seg{seg_idx}_st{state_idx}_out"
+                    if layer_idx == len(draw_order) - 1
+                    else f"seg{seg_idx}_st{state_idx}_layer{layer_idx}"
+                )
+
+                layer_state = state[name]
+                target_w = max(1, int(round(output_width * (layer_state['scale_pct'] / 100.0))))
+                target_h = max(1, int(round(output_height * (layer_state['scale_pct'] / 100.0))))
+                delay = seg_delays.get(name, 0.0)
+                crop_left_px = int(target_w * (layer_state['crop_left_pct'] / 100.0))
+                crop_right_px = int(target_w * (layer_state['crop_right_pct'] / 100.0))
+                crop_top_px = int(target_h * (layer_state['crop_top_pct'] / 100.0))
+                crop_bottom_px = int(target_h * (layer_state['crop_bottom_pct'] / 100.0))
+                crop_w = max(1, target_w - crop_left_px - crop_right_px)
+                crop_h = max(1, target_h - crop_top_px - crop_bottom_px)
+
+                # Important: crop is applied after resize so crop never stretches content.
+                chain = f"[{seg_input_map[name]}:v]scale={target_w}:{target_h},setsar=1"
+                if delay > 0.0005:
+                    chain += f",tpad=start_duration={delay:.3f}:start_mode=add"
+                chain += f",crop=w={crop_w}:h={crop_h}:x={crop_left_px}:y={crop_top_px}"
+                chain += (
+                    f",trim=start={state_start:.3f}:end={state_end:.3f},"
+                    f"setpts=PTS-STARTPTS[{clip_label}]"
+                )
+                filter_parts.append(chain)
+
+                overlay_x = int(round(output_width * (layer_state['position_x_pct'] / 100.0))) + crop_left_px
+                overlay_y = int(round(output_height * (layer_state['position_y_pct'] / 100.0))) + crop_top_px
+                filter_parts.append(
+                    f"[{prev_label}][{clip_label}]overlay={overlay_x}:{overlay_y}[{out_label}]"
+                )
+                prev_label = out_label
+
+            state_out = f"seg{seg_idx}_st{state_idx}_v"
+            filter_parts.append(f"[{prev_label}]format=yuv420p,setpts=PTS-STARTPTS[{state_out}]")
+            state_video_labels.append(state_out)
+
+        if len(state_video_labels) > 1:
+            concat_inputs = ''.join(f"[{label}]" for label in state_video_labels)
+            seg_video = f"seg{seg_idx}_vcat"
+            filter_parts.append(
+                f"{concat_inputs}concat=n={len(state_video_labels)}:v=1:a=0[{seg_video}]"
+            )
+        else:
+            seg_video = state_video_labels[0]
+
         v_label = f"v{seg_idx}"
-        filter_parts.append(f"[{prev_label}]format=yuv420p,setpts=PTS-STARTPTS[{v_label}]")
+        filter_parts.append(f"[{seg_video}]setpts=PTS-STARTPTS[{v_label}]")
         seg_video_labels.append(v_label)
 
         a_label = f"a{seg_idx}"
@@ -671,13 +889,33 @@ def render(args):
 
     filter_complex = ';'.join(filter_parts)
 
+    if not ffmpeg_has_encoder('h264_nvenc'):
+        raise AVEditorError(
+            "This av-editor build is configured to always use NVIDIA NVENC, "
+            "but ffmpeg does not expose h264_nvenc. Your ffmpeg may not be compiled with NVENC support."
+        )
+
+    print("\n🚀 GPU Acceleration enabled:")
+    print("  • Hardware decode: CUDA")
+    print("  • Hardware encode: NVENC (h264_nvenc)")
+
+    # Use NVIDIA NVENC hardware encoding
+    # Decode is hardware-accelerated via CUDA, encode via NVENC
+    video_codec_args: List[str] = [
+        '-c:v', 'h264_nvenc',
+        '-preset', 'p4',           # p4 = medium quality preset for newer NVENC
+        '-cq', '19',               # constant quality mode
+        '-b:v', '0',               # let CQ mode control bitrate
+        '-pix_fmt', 'yuv420p',
+    ]
+
     cmd.extend([
         '-filter_complex', filter_complex,
         '-map', f'[{final_v}]',
         '-map', f'[{final_a}]',
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', '18',
+    ])
+    cmd.extend(video_codec_args)
+    cmd.extend([
         '-c:a', 'aac',
         '-b:a', '192k',
         '-movflags', '+faststart',
