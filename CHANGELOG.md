@@ -1,3 +1,10 @@
+## [0.3.1](https://github.com/johnbenac/tools-av/compare/v0.3.0...v0.3.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* **av-editor:** use absolute master time for timeline at values ([b516337](https://github.com/johnbenac/tools-av/commit/b516337f516128917ebac07f43e82a963f67cb6c))
+
 # [0.3.0](https://github.com/johnbenac/tools-av/compare/v0.2.2...v0.3.0) (2026-02-16)
 
 
