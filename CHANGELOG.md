@@ -1,3 +1,10 @@
+# [0.4.0](https://github.com/johnbenac/tools-av/compare/v0.3.1...v0.4.0) (2026-02-16)
+
+
+### Features
+
+* **av-editor:** add placement controls and GPU acceleration ([fc4e5ec](https://github.com/johnbenac/tools-av/commit/fc4e5ec64bc1b4c8aa15ee8073cfd0f52cc38ce9))
+
 ## [0.3.1](https://github.com/johnbenac/tools-av/compare/v0.3.0...v0.3.1) (2026-02-16)
 
 
