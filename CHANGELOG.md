@@ -1,3 +1,10 @@
+## [0.2.2](https://github.com/johnbenac/tools-av/compare/v0.2.1...v0.2.2) (2026-02-16)
+
+
+### Bug Fixes
+
+* use absolute production start/end in av-editor ([f5fb3e4](https://github.com/johnbenac/tools-av/commit/f5fb3e4eb240824f37b5674c405b0153f61f82f7))
+
 ## [0.2.1](https://github.com/johnbenac/tools-av/compare/v0.2.0...v0.2.1) (2026-02-15)
 
 
