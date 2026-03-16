@@ -68,4 +68,3 @@ Demonstrates that timeline entries only override specified keys:
 - `{"at": 6.0, "z_index": -1}` keeps prior `position` and `scale`
 
 Run with `-v` to see per-segment state prints and confirm how timeline updates modify the initial values over time.
-

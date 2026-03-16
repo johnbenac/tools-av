@@ -44,7 +44,7 @@ ffmpeg -v error -y -f lavfi -i "color=c=blue:s=${WIDTH}x${HEIGHT}:r=${FPS}:d=${D
   -c:v libx264 -pix_fmt yuv420p -movflags +faststart "$BLUE_VIDEO"
 
 echo "[3/5] Writing demo JSON configs..."
-cat > "$CONFIG_01" <<EOF
+cat > "$CONFIG_01" <<EOF2
 {
   "master_audio": {
     "file": "$MASTER_AUDIO",
@@ -96,9 +96,9 @@ cat > "$CONFIG_01" <<EOF
     "includes": {}
   }
 }
-EOF
+EOF2
 
-cat > "$CONFIG_02" <<EOF
+cat > "$CONFIG_02" <<EOF2
 {
   "master_audio": {
     "file": "$MASTER_AUDIO",
@@ -154,9 +154,9 @@ cat > "$CONFIG_02" <<EOF
     }
   }
 }
-EOF
+EOF2
 
-cat > "$CONFIG_03" <<EOF
+cat > "$CONFIG_03" <<EOF2
 {
   "master_audio": {
     "file": "$MASTER_AUDIO",
@@ -200,17 +200,16 @@ cat > "$CONFIG_03" <<EOF
     "includes": {}
   }
 }
-EOF
+EOF2
 
 echo "[4/5] Demo configs:"
 echo "  - $CONFIG_01"
 echo "  - $CONFIG_02"
 echo "  - $CONFIG_03"
 
-cat <<EOF
+cat <<EOF2
 [5/5] Next steps:
   /opt/tools-av/av-editor/av-editor render "$CONFIG_01" --force -v
   /opt/tools-av/av-editor/av-editor render "$CONFIG_02" --force -v
   /opt/tools-av/av-editor/av-editor render "$CONFIG_03" --force -v
-EOF
-
+EOF2
